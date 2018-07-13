@@ -1,5 +1,5 @@
 {
-  "name": "netlink",
+  "name": "node-netlink",
   "version": "0.0.1",
   "description": "netlink bindings for node.js",
   "main": "index.js",
