@@ -1,0 +1,25 @@
+{
+  "name": "netlink",
+  "version": "0.0.1",
+  "description": "netlink bindings for node.js",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha"
+  },
+  "dependencies": {
+    "nan": "^2.10.0"
+  },
+  "devDependencies": {
+    "mocha": "^5.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k13-engineering/node-netlink.git"
+  },
+  "author": "Simon Kadisch",
+  "license": "GPL-3.0",
+  "bugs": {
+    "url": "https://github.com/k13-engineering/node-netlink/issues"
+  },
+  "homepage": "https://github.com/k13-engineering/node-netlink#readme"
+}
