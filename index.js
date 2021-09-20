@@ -1,8 +1,7 @@
-const assert = require("assert");
-const fs = require("fs");
-const EventEmitter = require("events");
 
-const native = require("./build/Release/netlink-native.node");
+import assert from "assert";
+import fs from "fs";
+import EventEmitter from "events";
 
 const AF_NETLINK = 16;
 const SOCK_DGRAM = 2;
@@ -104,7 +103,7 @@ const open = (opts) => {
       requested[header.nlmsg_seq] = {
         "msgs": [],
         "multi": false,
-        "schedule": schedule,
+        schedule,
         "cb": (err, data) => {
           clearTimeout(schedule);
           Reflect.deleteProperty(requested, header.nlmsg_seq);
@@ -118,7 +117,7 @@ const open = (opts) => {
       };
 
       send({
-        "header": header,
+        header,
         "payload": obj.payload
       }).catch(reject);
     });
@@ -134,7 +133,7 @@ const open = (opts) => {
   });
 };
 
-module.exports = {
+export default {
   NLM_F_ECHO,
   NLM_F_REQUEST,
   NLM_F_MULTI,
@@ -142,7 +141,7 @@ module.exports = {
   NLM_F_ACK,
   NLM_F_CREATE,
   NLM_F_EXCL,
-  
+
   NLMSG_DONE,
   NLMSG_ERROR,
 
