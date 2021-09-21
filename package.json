@@ -9,8 +9,6 @@
     "eslint": "eslint ."
   },
   "dependencies": {
-    "libjs": "^0.3.0",
-    "libsys": "^3.0.0",
     "struct": "0.0.12"
   },
   "devDependencies": {
