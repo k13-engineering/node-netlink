@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.0.2",
   "description": "netlink bindings for node.js",
-  "main": "index.js",
+  "main": "lib/index.js",
   "scripts": {
     "test": "c8 --reporter lcov --reporter html --reporter text mocha",
     "eslint": "eslint ."
