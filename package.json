@@ -1,23 +1,28 @@
 {
   "name": "node-netlink",
+  "type": "module",
   "version": "0.0.1",
   "description": "netlink bindings for node.js",
-  "main": "index.js",
+  "main": "lib/index.js",
   "scripts": {
-    "test": "mocha"
+    "test": "c8 --reporter lcov --reporter html --reporter text mocha",
+    "eslint": "eslint ."
   },
   "dependencies": {
-    "nan": "^2.10.0"
+    "po6-socket": "^0.0.1",
+    "ya-struct": "^0.0.4"
   },
   "devDependencies": {
-    "mocha": "^5.2.0"
+    "c8": "^7.10.0",
+    "eslint": "^7.32.0",
+    "mocha": "^9.1.3"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/k13-engineering/node-netlink.git"
   },
   "author": "Simon Kadisch",
-  "license": "GPL-3.0",
+  "license": "LGPL 2.1",
   "bugs": {
     "url": "https://github.com/k13-engineering/node-netlink/issues"
   },
