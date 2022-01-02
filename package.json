@@ -9,7 +9,7 @@
     "eslint": "eslint ."
   },
   "dependencies": {
-    "po6-socket": "^0.0.1",
+    "po6-socket": "^0.0.2",
     "ya-struct": "^0.0.4"
   },
   "devDependencies": {
