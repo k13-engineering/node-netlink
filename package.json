@@ -1,7 +1,7 @@
 {
   "name": "node-netlink",
   "type": "module",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "netlink bindings for node.js",
   "main": "lib/index.js",
   "scripts": {
