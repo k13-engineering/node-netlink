@@ -1,8 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "mocha";
 import {
-  NETLINK_GENERIC,
-  NETLINK_ROUTE,
   NLM_F_ACK,
   NLM_F_DUMP,
   NLM_F_MULTI,
@@ -17,7 +15,7 @@ import {
   type TNetlinkHeader,
   type TNetlinkMessage
 } from "./message.ts";
-import { createNetlink, seqAfter, type TOpenArgs } from "./netlink-socket.ts";
+import { createNetlinkSocket, seqAfter, type TCreateNetlinkSocketArgs } from "./netlink-socket.ts";
 import { hostStructures } from "./structures.ts";
 import { createFakeTransport } from "./test-support/fakes.ts";
 
@@ -30,29 +28,24 @@ const int32 = ({ value }: { value: number }) => {
   return new Uint8Array(new Int32Array([value]).buffer);
 };
 
-const createTestSetup = ({ openArgs = {} }: { openArgs?: Partial<TOpenArgs> } = {}) => {
-  const fakeTransport = createFakeTransport();
+const createTestSetup = ({ socketArgs = {}, nl_groups }: {
+  socketArgs?: Partial<TCreateNetlinkSocketArgs>,
+  nl_groups?: bigint,
+} = {}) => {
+  const fakeTransport = createFakeTransport({ nl_groups });
 
-  let unhandledErrors: Error[] = [];
+  let errors: Error[] = [];
   let unsolicited: TNetlinkMessage[] = [];
 
-  const { open } = createNetlink({
-    transportFactory: fakeTransport.transportFactory,
-    structures,
-    createErrorFromErrno: ({ operation, errno }) => {
-      return Error(`${operation} failed with errno ${errno}`);
-    },
-    reportUnhandledError: ({ error }) => {
-      unhandledErrors = [...unhandledErrors, error];
-    },
-  });
-
-  const socket = open({
-    family: NETLINK_ROUTE,
+  const socket = createNetlinkSocket({
+    transport: fakeTransport.transport,
     onMessage: ({ message }) => {
       unsolicited = [...unsolicited, message];
     },
-    ...openArgs,
+    onError: ({ error }) => {
+      errors = [...errors, error];
+    },
+    ...socketArgs,
   });
 
   const sentMessages = () => {
@@ -108,8 +101,8 @@ const createTestSetup = ({ openArgs = {} }: { openArgs?: Partial<TOpenArgs> } = 
     lastSentHeader,
     respond,
     ack,
-    unhandledErrors: () => {
-      return unhandledErrors;
+    errors: () => {
+      return errors;
     },
     unsolicited: () => {
       return unsolicited;
@@ -128,23 +121,18 @@ describe("netlink socket", () => {
     });
   });
 
-  describe("opening", () => {
-    it("should open the transport with the family and a kernel assigned port id by default", () => {
-      const { fakeTransport } = createTestSetup();
+  describe("creation", () => {
+    it("should listen on the transport", () => {
+      const { fakeTransport, respond, unsolicited } = createTestSetup();
 
-      assert.strictEqual(fakeTransport.opened().family, NETLINK_ROUTE);
-      assert.deepStrictEqual(fakeTransport.opened().address, { nl_pid: 0n, nl_groups: 0n });
-    });
+      respond({ messages: [{ header: { nlmsg_seq: 0n }, payload: new Uint8Array(0) }] });
 
-    it("should open the transport with the requested address", () => {
-      const { fakeTransport } = createTestSetup({ openArgs: { family: NETLINK_GENERIC, nl_pid: 3n, nl_groups: 5n } });
-
-      assert.strictEqual(fakeTransport.opened().family, NETLINK_GENERIC);
-      assert.deepStrictEqual(fakeTransport.opened().address, { nl_pid: 3n, nl_groups: 5n });
+      assert.strictEqual(unsolicited().length, 1);
+      assert.strictEqual(fakeTransport.stopCount(), 0);
     });
 
     it("should expose the address of the transport", () => {
-      const { socket } = createTestSetup({ openArgs: { nl_groups: 5n } });
+      const { socket } = createTestSetup({ nl_groups: 5n });
 
       assert.strictEqual(socket.nl_pid, 4711n);
       assert.strictEqual(socket.nl_groups, 5n);
@@ -175,13 +163,13 @@ describe("netlink socket", () => {
       assert.deepStrictEqual(lastSentHeader(), header);
     });
 
-    it("should throw once the socket is closed", () => {
+    it("should throw once the socket is detached", () => {
       const { socket } = createTestSetup();
-      socket.close();
+      socket.detach();
 
       assert.throws(() => {
         socket.send({ header: { nlmsg_type: RTM_GETLINK }, payload: new Uint8Array(0) });
-      }, /netlink socket is closed/);
+      }, /netlink socket is detached/);
     });
   });
 
@@ -290,11 +278,12 @@ describe("netlink socket", () => {
       await assert.rejects(socket.tryTalk({ header: { nlmsg_type: RTM_NEWLINK }, payload: new Uint8Array(4) }), /send failed/);
     });
 
-    it("should reject once the socket is closed", async () => {
+    it("should reject once the socket is detached", async () => {
       const { socket } = createTestSetup();
-      socket.close();
+      socket.detach();
 
-      await assert.rejects(socket.tryTalk({ header: { nlmsg_type: RTM_NEWLINK }, payload: new Uint8Array(4) }), /netlink socket is closed/);
+      const result = socket.tryTalk({ header: { nlmsg_type: RTM_NEWLINK }, payload: new Uint8Array(4) });
+      await assert.rejects(result, /netlink socket is detached/);
     });
   });
 
@@ -317,7 +306,7 @@ describe("netlink socket", () => {
       const result = socket.talk({ header: { nlmsg_type: RTM_NEWLINK }, payload: new Uint8Array(4) });
       respond({ messages: [ack({ error: -1 })] });
 
-      await assert.rejects(result, /netlink request of type 16 failed with errno 1/);
+      await assert.rejects(result, /netlink request of type 16 failed with EPERM/);
     });
   });
 
@@ -342,13 +331,13 @@ describe("netlink socket", () => {
       assert.strictEqual(unsolicited().length, 1);
     });
 
-    it("should stop delivering once a handler closed the socket", () => {
+    it("should stop delivering once a handler detached the socket", () => {
       let delivered = 0;
       const { socket, respond } = createTestSetup({
-        openArgs: {
+        socketArgs: {
           onMessage: () => {
             delivered += 1;
-            socket.close();
+            socket.detach();
           },
         },
       });
@@ -364,74 +353,71 @@ describe("netlink socket", () => {
     });
 
     it("should drop unsolicited messages without onMessage handler", () => {
-      const { respond, unhandledErrors } = createTestSetup({ openArgs: { onMessage: undefined } });
+      const { respond, errors } = createTestSetup({ socketArgs: { onMessage: undefined } });
 
       respond({ messages: [{ header: { nlmsg_seq: 0n }, payload: Uint8Array.from([1]) }] });
 
-      assert.deepStrictEqual(unhandledErrors(), []);
+      assert.deepStrictEqual(errors(), []);
     });
   });
 
   describe("errors", () => {
     it("should pass malformed datagrams to onError", () => {
-      let errors: Error[] = [];
-      const { fakeTransport, unhandledErrors } = createTestSetup({
-        openArgs: {
-          onError: ({ error }) => {
-            errors = [...errors, error];
-          },
-        },
-      });
+      const { fakeTransport, errors } = createTestSetup();
 
       fakeTransport.deliver({ data: new Uint8Array(3) });
 
-      assert.strictEqual(errors.length, 1);
-      assert.match(errors[0].message, /malformed netlink message/);
-      assert.deepStrictEqual(unhandledErrors(), []);
+      assert.strictEqual(errors().length, 1);
+      assert.match(errors()[0].message, /malformed netlink message/);
     });
 
     it("should pass transport errors to onError", () => {
-      let errors: Error[] = [];
-      const { fakeTransport } = createTestSetup({
-        openArgs: {
-          onError: ({ error }) => {
-            errors = [...errors, error];
-          },
-        },
-      });
+      const { fakeTransport, errors } = createTestSetup();
 
       const error = Error("receive failed");
       fakeTransport.raise({ error });
 
-      assert.deepStrictEqual(errors, [error]);
+      assert.deepStrictEqual(errors(), [error]);
     });
 
-    it("should report errors as unhandled without onError handler", () => {
-      const { fakeTransport, unhandledErrors } = createTestSetup();
+    it("should throw errors asynchronously without onError handler", async () => {
+      const { fakeTransport } = createTestSetup({ socketArgs: { onError: undefined } });
 
-      fakeTransport.deliver({ data: new Uint8Array(3) });
+      const listeners = process.listeners("uncaughtException");
+      process.removeAllListeners("uncaughtException");
 
-      assert.strictEqual(unhandledErrors().length, 1);
+      try {
+        const thrown = await new Promise<Error>((resolve) => {
+          process.once("uncaughtException", resolve);
+          fakeTransport.deliver({ data: new Uint8Array(3) });
+        });
+
+        assert.match(thrown.message, /malformed netlink message/);
+      } finally {
+        listeners.forEach((listener) => {
+          process.on("uncaughtException", listener);
+        });
+      }
     });
   });
 
-  describe("close", () => {
-    it("should close the transport once", () => {
+  describe("detach", () => {
+    it("should stop listening on the transport once", () => {
       const { socket, fakeTransport } = createTestSetup();
 
-      socket.close();
-      socket.close();
+      socket.detach();
+      socket.detach();
 
-      assert.strictEqual(fakeTransport.closeCount(), 1);
+      assert.strictEqual(fakeTransport.stopCount(), 1);
     });
 
     it("should reject pending requests", async () => {
       const { socket } = createTestSetup();
 
       const result = socket.tryTalk({ header: { nlmsg_type: RTM_NEWLINK }, payload: new Uint8Array(4) });
-      socket.close();
+      socket.detach();
 
-      await assert.rejects(result, /netlink socket was closed while waiting for a response/);
+      await assert.rejects(result, /netlink socket was detached while waiting for a response/);
     });
   });
 });

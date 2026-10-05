@@ -12,19 +12,19 @@
     "@eslint/js": "^10.0.1",
     "@k13engineering/eslint-rules": "^0.0.6",
     "@k13engineering/releasetool": "^0.0.5",
+    "@k13engineering/uv-poll": "^0.0.6",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.0",
+    "buffer2address": "^0.1.1",
     "c8": "^11.0.0",
     "deno-node": "^0.0.12",
     "mocha": "^12.0.2",
     "npm-check-updates": "^20.0.2",
+    "syscall-napi": "^0.2.2",
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "@k13engineering/uv-poll": "^0.0.6",
-    "buffer2address": "^0.1.1",
     "po6": "^0.1.0",
-    "syscall-napi": "^0.2.2",
     "ya-struct": "^0.0.17"
   }
 }

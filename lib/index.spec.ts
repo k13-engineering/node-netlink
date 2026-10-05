@@ -1,12 +1,18 @@
 import assert from "node:assert";
 import { describe, it } from "mocha";
 import {
+  createNetlinkSocket,
+  createPo6NetlinkTransport,
   NETLINK_ROUTE,
   NLM_F_DUMP,
-  openNetlinkSocket,
   type TNetlinkSocket
 } from "./index.ts";
-import { reportUnhandledError } from "./system.ts";
+import {
+  createPoller,
+  kernelAbi,
+  openHostNetlinkSocket,
+  po6
+} from "./test-support/host-socket.ts";
 
 // <linux/rtnetlink.h>
 const RTM_NEWLINK = 16n;
@@ -24,24 +30,34 @@ const indexOfLink = ({ payload }: { payload: Uint8Array }) => {
   return new DataView(payload.buffer, payload.byteOffset).getInt32(4, true);
 };
 
-// errno of the host, used to check that the kernel's error reaches the caller
 const ENODEV = 19;
+
+const attach = ({ fd }: { fd: number }) => {
+  const transport = createPo6NetlinkTransport({ fd, po6, kernelAbi, createPoller });
+  return createNetlinkSocket({ transport });
+};
 
 const withSocket = async ({ nl_groups, callback }: {
   nl_groups?: bigint,
   callback: (args: { socket: TNetlinkSocket }) => Promise<void>,
 }) => {
-  const socket = openNetlinkSocket({ family: NETLINK_ROUTE, nl_groups });
+  const hostSocket = openHostNetlinkSocket({ family: NETLINK_ROUTE, nl_groups });
 
   try {
-    await callback({ socket });
+    const socket = attach({ fd: hostSocket.fd });
+
+    try {
+      await callback({ socket });
+    } finally {
+      socket.detach();
+    }
   } finally {
-    socket.close();
+    hostSocket.close();
   }
 };
 
 describe("node-netlink on the host kernel", () => {
-  it("should bind synchronously and report the port id assigned by the kernel", async () => {
+  it("should report the port id assigned by the kernel", async () => {
     await withSocket({
       callback: async ({ socket }) => {
         assert.ok(socket.nl_pid > 0n);
@@ -50,7 +66,7 @@ describe("node-netlink on the host kernel", () => {
     });
   });
 
-  it("should bind to multicast groups", async () => {
+  it("should report the multicast groups the socket is bound to", async () => {
     await withSocket({
       nl_groups: RTMGRP_LINK,
       callback: async ({ socket }) => {
@@ -98,7 +114,7 @@ describe("node-netlink on the host kernel", () => {
         const args = { header: { nlmsg_type: RTM_GETLINK }, payload: ifinfomsg({ index: 0x7FFF_FFFF }) };
 
         assert.deepStrictEqual(await socket.tryTalk(args), { errno: ENODEV, messages: [] });
-        await assert.rejects(socket.talk(args), /failed with ENODEV: No such device/);
+        await assert.rejects(socket.talk(args), /netlink request of type 18 failed with ENODEV/);
       },
     });
   });
@@ -119,31 +135,25 @@ describe("node-netlink on the host kernel", () => {
     });
   });
 
-  it("should throw synchronously for unsupported families", () => {
-    assert.throws(() => {
-      openNetlinkSocket({ family: 32n });
-    }, /socket\(\) failed with EPROTONOSUPPORT/);
-  });
+  it("should leave the socket open when detaching", async () => {
+    const hostSocket = openHostNetlinkSocket({ family: NETLINK_ROUTE });
 
-  describe("reportUnhandledError", () => {
-    it("should throw the error asynchronously", async () => {
-      const error = Error("unhandled");
+    try {
+      const first = attach({ fd: hostSocket.fd });
+      first.detach();
 
-      const listeners = process.listeners("uncaughtException");
-      process.removeAllListeners("uncaughtException");
+      // the file descriptor is still usable, so a new netlink socket can be attached to it
+      const second = attach({ fd: hostSocket.fd });
 
       try {
-        const thrown = await new Promise((resolve) => {
-          process.once("uncaughtException", resolve);
-          reportUnhandledError({ error });
-        });
-
-        assert.strictEqual(thrown, error);
+        const messages = await second.talk({ header: { nlmsg_type: RTM_GETLINK }, payload: ifinfomsg({ index: 1 }) });
+        assert.strictEqual(messages.length, 1);
+        assert.strictEqual(second.nl_pid, first.nl_pid);
       } finally {
-        listeners.forEach((listener) => {
-          process.on("uncaughtException", listener);
-        });
+        second.detach();
       }
-    });
+    } finally {
+      hostSocket.close();
+    }
   });
 });

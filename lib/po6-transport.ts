@@ -1,14 +1,9 @@
 import type { TPo6Api, TPo6KernelAbi } from "po6";
 import { AF_NETLINK } from "./constants.ts";
-import type { TNetlinkStructures } from "./structures.ts";
-import type { TNetlinkAddress, TNetlinkTransportFactory } from "./netlink-socket.ts";
+import type { TNetlinkAddress, TNetlinkTransport } from "./netlink-socket.ts";
+import { formatNetlinkAddress, hostStructures, type TNetlinkStructures } from "./structures.ts";
 
-// <linux/net.h> and <asm-generic/fcntl.h>, the same on x86, arm and arm64
-const SOCK_DGRAM = 2n;
-const SOCK_NONBLOCK = 0o4000n;
-const SOCK_CLOEXEC = 0o2000000n;
-
-type TPo6NetlinkSyscalls = Pick<TPo6Api, "socket" | "bind" | "getsockname" | "sendmsg" | "recvmsg" | "close" | "createErrorFromErrno">;
+type TPo6NetlinkSyscalls = Pick<TPo6Api, "getsockname" | "sendmsg" | "recvmsg" | "createErrorFromErrno">;
 
 type TPoller = {
   armOnce: (events: {
@@ -20,11 +15,13 @@ type TPoller = {
 
 type TCreatePoller = (args: { fd: number }) => TPoller;
 
-type TPo6TransportDependencies = {
+type TCreatePo6NetlinkTransportArgs = {
+  // a netlink socket opened and bound by the caller, who also closes it
+  fd: number;
   po6: TPo6NetlinkSyscalls;
   kernelAbi: Pick<TPo6KernelAbi, "constants" | "errnoCodes">;
   createPoller: TCreatePoller;
-  structures: TNetlinkStructures;
+  structures?: TNetlinkStructures;
 };
 
 type TReceiveResult = {
@@ -35,41 +32,41 @@ type TReceiveResult = {
   data: Uint8Array;
 };
 
-const createPo6TransportFactory = ({ po6, kernelAbi, createPoller, structures }: TPo6TransportDependencies): TNetlinkTransportFactory => {
+/**
+ * Adapts a netlink socket file descriptor to a transport, using the given po6 syscalls and poller.
+ * The socket is neither opened nor closed here, it is owned by the caller.
+ */
+const createPo6NetlinkTransport = ({
+  fd,
+  po6,
+  kernelAbi,
+  createPoller,
+  structures = hostStructures,
+}: TCreatePo6NetlinkTransportArgs): TNetlinkTransport => {
 
   const { MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC } = kernelAbi.constants;
   const { EAGAIN, ENOBUFS } = kernelAbi.errnoCodes;
 
-  const throwOnErrno = ({ operation, errno }: { operation: string, errno: number | undefined }) => {
+  const queryAddress = (): TNetlinkAddress => {
+    const { errno, sockaddr } = po6.getsockname({ fd });
+
     if (errno !== undefined) {
-      throw po6.createErrorFromErrno({ operation, errno });
+      throw po6.createErrorFromErrno({ operation: "getsockname()", errno });
     }
-  };
 
-  const formatAddress = ({ address }: { address: TNetlinkAddress }) => {
-    return structures.sockaddrNl.format({
-      value: {
-        nl_family: AF_NETLINK,
-        nl_pad: 0n,
-        ...address,
-      }
-    });
-  };
+    const { nl_family, nl_pid, nl_groups } = structures.sockaddrNl.parse({ data: sockaddr });
 
-  const kernelAddress = formatAddress({ address: { nl_pid: 0n, nl_groups: 0n } });
+    if (nl_family !== AF_NETLINK) {
+      throw Error(`file descriptor ${fd} is not a netlink socket, its address family is ${nl_family}`);
+    }
 
-  const bindAndQueryAddress = ({ fd, address }: { fd: number, address: TNetlinkAddress }): TNetlinkAddress => {
-    const { errno: bindErrno } = po6.bind({ fd, sockaddr: formatAddress({ address }) });
-    throwOnErrno({ operation: "bind()", errno: bindErrno });
-
-    const { errno: getsocknameErrno, sockaddr } = po6.getsockname({ fd });
-    throwOnErrno({ operation: "getsockname()", errno: getsocknameErrno });
-
-    const { nl_pid, nl_groups } = structures.sockaddrNl.parse({ data: sockaddr as Uint8Array });
     return { nl_pid, nl_groups };
   };
 
-  const receiveDatagram = ({ fd }: { fd: number }): TReceiveResult => {
+  const address = queryAddress();
+  const kernelAddress = formatNetlinkAddress({ address: { nl_pid: 0n, nl_groups: 0n }, structures });
+
+  const receiveDatagram = (): TReceiveResult => {
     // with MSG_TRUNC, netlink reports the full length of the datagram, even if the buffer is smaller
     const { errno: peekErrno, bytesReceived: datagramLength } = po6.recvmsg({
       fd,
@@ -91,37 +88,20 @@ const createPo6TransportFactory = ({ po6, kernelAbi, createPoller, structures }:
     return { errno: undefined, data: data.subarray(0, bytesReceived) };
   };
 
-  // eslint-disable-next-line max-statements
-  return ({ family, address: requestedAddress, onData, onError }) => {
-    const { errno: socketErrno, fd } = po6.socket({
-      domain: AF_NETLINK,
-      type: SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-      protocol: family,
-    });
+  const send: TNetlinkTransport["send"] = ({ data }) => {
+    const { errno } = po6.sendmsg({ fd, data, msghdr: { msg_name: kernelAddress } });
 
-    if (socketErrno !== undefined) {
-      throw po6.createErrorFromErrno({ operation: "socket()", errno: socketErrno });
+    if (errno !== undefined) {
+      throw po6.createErrorFromErrno({ operation: "sendmsg()", errno });
     }
+  };
 
-    let address: TNetlinkAddress;
-    let poller: TPoller;
-
-    try {
-      address = bindAndQueryAddress({ fd, address: requestedAddress });
-      poller = createPoller({ fd });
-    } catch (ex) {
-      po6.close({ fd });
-      throw ex;
-    }
-
-    let closed = false;
-
-    const reportErrno = ({ errno }: { errno: number }) => {
-      onError({ error: po6.createErrorFromErrno({ operation: "recvmsg()", errno }) });
-    };
+  const listen: TNetlinkTransport["listen"] = ({ onData, onError }) => {
+    const poller = createPoller({ fd });
+    let stopped = false;
 
     const receiveAndDispatch = (): "continue" | "wait" | "stop" => {
-      const { errno, data } = receiveDatagram({ fd });
+      const { errno, data } = receiveDatagram();
 
       if (errno === undefined) {
         onData({ data });
@@ -132,7 +112,7 @@ const createPo6TransportFactory = ({ po6, kernelAbi, createPoller, structures }:
         return "wait";
       }
 
-      reportErrno({ errno });
+      onError({ error: po6.createErrorFromErrno({ operation: "recvmsg()", errno }) });
 
       // ENOBUFS: the receive buffer overflowed and messages were lost, the socket is still usable
       return errno === ENOBUFS ? "continue" : "stop";
@@ -142,11 +122,11 @@ const createPo6TransportFactory = ({ po6, kernelAbi, createPoller, structures }:
     const drain = () => {
       let state = receiveAndDispatch();
 
-      while (state === "continue" && !closed) {
+      while (state === "continue" && !stopped) {
         state = receiveAndDispatch();
       }
 
-      return state === "wait" && !closed;
+      return state === "wait" && !stopped;
     };
 
     const arm = () => {
@@ -162,36 +142,34 @@ const createPo6TransportFactory = ({ po6, kernelAbi, createPoller, structures }:
       });
     };
 
-    const send = ({ data }: { data: Uint8Array }) => {
-      const { errno } = po6.sendmsg({ fd, data, msghdr: { msg_name: kernelAddress } });
-      throwOnErrno({ operation: "sendmsg()", errno });
-    };
-
-    const close = () => {
-      closed = true;
-      poller.close();
-
-      const { errno } = po6.close({ fd });
-      throwOnErrno({ operation: "close()", errno });
-    };
-
     arm();
 
     return {
-      address,
-      send,
-      close,
+      stop: () => {
+        if (stopped) {
+          return;
+        }
+
+        stopped = true;
+        poller.close();
+      },
     };
+  };
+
+  return {
+    address,
+    send,
+    listen,
   };
 };
 
 export {
-  createPo6TransportFactory,
+  createPo6NetlinkTransport,
 };
 
 export type {
   TPo6NetlinkSyscalls,
   TPoller,
   TCreatePoller,
-  TPo6TransportDependencies,
+  TCreatePo6NetlinkTransportArgs,
 };

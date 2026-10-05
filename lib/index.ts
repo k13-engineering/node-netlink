@@ -1,28 +1,29 @@
-import { createNetlink } from "./netlink-socket.ts";
-import { createPo6TransportFactory } from "./po6-transport.ts";
+import { createErrorFromErrno } from "./errno.ts";
+import { createNetlinkSocket } from "./netlink-socket.ts";
+import { createPo6NetlinkTransport } from "./po6-transport.ts";
 import { errnoOfMessage, formatMessage, nlmsgAlign, parseMessages } from "./message.ts";
 import {
   createNetlinkStructuresFor,
+  formatNetlinkAddress,
   hostStructures,
   nlmsgerrDefinition,
   nlmsghdrDefinition,
   sockaddrNlDefinition
 } from "./structures.ts";
-import { openNetlinkSocket } from "./system.ts";
 
 export * from "./constants.ts";
 
 export {
-  openNetlinkSocket,
-
-  createNetlink,
-  createPo6TransportFactory,
+  createNetlinkSocket,
+  createPo6NetlinkTransport,
 
   parseMessages,
   formatMessage,
   errnoOfMessage,
   nlmsgAlign,
+  createErrorFromErrno,
 
+  formatNetlinkAddress,
   createNetlinkStructuresFor,
   hostStructures,
   sockaddrNlDefinition,
@@ -33,20 +34,19 @@ export {
 export type {
   TNetlinkAddress,
   TNetlinkTransport,
-  TNetlinkTransportFactory,
   TNetlinkSocket,
-  TOpenArgs,
+  TCreateNetlinkSocketArgs,
   TTalkArgs,
   TTryTalkResult,
   TRequestHeader,
   TSendHeader,
-  TNetlinkDependencies,
 } from "./netlink-socket.ts";
 export type { TNetlinkHeader, TNetlinkMessage } from "./message.ts";
 export type { TNetlinkStructures } from "./structures.ts";
+export type { TErrorWithErrno } from "./errno.ts";
 export type {
   TPo6NetlinkSyscalls,
   TPoller,
   TCreatePoller,
-  TPo6TransportDependencies,
+  TCreatePo6NetlinkTransportArgs,
 } from "./po6-transport.ts";

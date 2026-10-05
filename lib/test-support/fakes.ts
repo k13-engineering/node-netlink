@@ -5,8 +5,9 @@ import {
   type TLinuxKernelInterface,
   type TMemoryInterface
 } from "po6";
+import type { TNetlinkTransport } from "../netlink-socket.ts";
 import type { TCreatePoller, TPo6NetlinkSyscalls, TPoller } from "../po6-transport.ts";
-import type { TNetlinkTransport, TNetlinkTransportFactory } from "../netlink-socket.ts";
+import { formatNetlinkAddress } from "../structures.ts";
 
 const kernelAbi = createKernelAbiFor({ machineAbi: hostAbi });
 const { errnoCodes } = kernelAbi;
@@ -18,7 +19,7 @@ const { createErrorFromErrno } = createPo6Api({
   memory: {} as TMemoryInterface,
 });
 
-type TSyscallName = "socket" | "bind" | "getsockname" | "sendmsg" | "recvmsg" | "close";
+type TSyscallName = "getsockname" | "sendmsg" | "recvmsg";
 
 type TCall = {
   name: TSyscallName;
@@ -27,7 +28,7 @@ type TCall = {
 
 /**
  * A fake kernel for a single netlink socket.
- * Datagrams in `incoming` are returned by recvmsg(), `failures` makes the next call of a syscall fail.
+ * Datagrams in `incoming` are returned by recvmsg(), `failNext` sets the result of the next call of a syscall.
  */
 const createFakePo6 = () => {
   const fd = 42;
@@ -35,8 +36,7 @@ const createFakePo6 = () => {
   let calls: TCall[] = [];
   let incoming: (Uint8Array | { errno: number })[] = [];
   let failures: Partial<Record<TSyscallName, (number | undefined)[]>> = {};
-  let boundAddress = new Uint8Array(12);
-  let assignedPid = 4711;
+  let sockname = formatNetlinkAddress({ address: { nl_pid: 4711n, nl_groups: 0n } });
 
   const record = ({ name, args }: TCall) => {
     calls = [...calls, { name, args }];
@@ -46,26 +46,9 @@ const createFakePo6 = () => {
     return errno;
   };
 
-  const socket: TPo6NetlinkSyscalls["socket"] = (args) => {
-    const errno = record({ name: "socket", args });
-    return errno === undefined ? { errno, fd } : { errno, fd: undefined };
-  };
-
-  const bind: TPo6NetlinkSyscalls["bind"] = (args) => {
-    boundAddress = args.sockaddr.slice();
-    return { errno: record({ name: "bind", args }) };
-  };
-
   const getsockname: TPo6NetlinkSyscalls["getsockname"] = (args) => {
     const errno = record({ name: "getsockname", args });
-
-    if (errno !== undefined) {
-      return { errno, sockaddr: undefined };
-    }
-
-    const sockaddr = boundAddress.slice();
-    new DataView(sockaddr.buffer).setUint32(4, assignedPid, true);
-    return { errno, sockaddr };
+    return errno === undefined ? { errno, sockaddr: sockname.slice() } : { errno, sockaddr: undefined };
   };
 
   const sendmsg: TPo6NetlinkSyscalls["sendmsg"] = (args) => {
@@ -97,17 +80,10 @@ const createFakePo6 = () => {
     return { errno: undefined, bytesReceived: next.length, msghdr };
   };
 
-  const close: TPo6NetlinkSyscalls["close"] = (args) => {
-    return { errno: record({ name: "close", args }) };
-  };
-
   const po6: TPo6NetlinkSyscalls = {
-    socket,
-    bind,
     getsockname,
     sendmsg,
     recvmsg,
-    close,
     createErrorFromErrno,
   };
 
@@ -130,8 +106,8 @@ const createFakePo6 = () => {
     failNext: ({ name, errno }: { name: TSyscallName, errno: number | undefined }) => {
       failures = { ...failures, [name]: [...(failures[name] ?? []), errno] };
     },
-    assignPid: ({ pid }: { pid: number }) => {
-      assignedPid = pid;
+    setSockname: ({ sockaddr }: { sockaddr: Uint8Array }) => {
+      sockname = sockaddr;
     },
   };
 };
@@ -145,13 +121,8 @@ const createFakePoller = () => {
   let armed: TArmedEvents | undefined;
   let closed = false;
   let createdFor: number | undefined;
-  let createError: Error | undefined;
 
   const createPoller: TCreatePoller = ({ fd }) => {
-    if (createError !== undefined) {
-      throw createError;
-    }
-
     createdFor = fd;
 
     return {
@@ -159,6 +130,10 @@ const createFakePoller = () => {
         armed = events;
       },
       close: () => {
+        if (closed) {
+          throw Error("already closed");
+        }
+
         closed = true;
         armed = undefined;
       },
@@ -188,9 +163,6 @@ const createFakePoller = () => {
     fdOfPoller: () => {
       return createdFor;
     },
-    failCreation: ({ error }: { error: Error }) => {
-      createError = error;
-    },
     triggerReadable: () => {
       takeArmed().readable();
     },
@@ -200,63 +172,62 @@ const createFakePoller = () => {
   };
 };
 
-type TTransportArgs = Parameters<TNetlinkTransportFactory>[0];
+type TListenArgs = Parameters<TNetlinkTransport["listen"]>[0];
 
 /**
  * A transport that records sent datagrams and lets the test deliver received ones.
  */
-const createFakeTransport = () => {
+const createFakeTransport = ({ nl_groups = 0n }: { nl_groups?: bigint } = {}) => {
   let sent: Uint8Array[] = [];
-  let openedWith: TTransportArgs | undefined;
-  let closeCount = 0;
+  let listener: TListenArgs | undefined;
+  let stopCount = 0;
   let sendError: Error | undefined;
 
-  const transportFactory: TNetlinkTransportFactory = (args) => {
-    openedWith = args;
+  const transport: TNetlinkTransport = {
+    address: { nl_pid: 4711n, nl_groups },
+    send: ({ data }) => {
+      if (sendError !== undefined) {
+        throw sendError;
+      }
 
-    const transport: TNetlinkTransport = {
-      address: { nl_pid: 4711n, nl_groups: args.address.nl_groups },
-      send: ({ data }) => {
-        if (sendError !== undefined) {
-          throw sendError;
-        }
+      sent = [...sent, data];
+    },
+    listen: (args) => {
+      listener = args;
 
-        sent = [...sent, data];
-      },
-      close: () => {
-        closeCount += 1;
-      },
-    };
-
-    return transport;
+      return {
+        stop: () => {
+          stopCount += 1;
+        },
+      };
+    },
   };
 
-  const opened = () => {
-    if (openedWith === undefined) {
-      throw Error("transport was not opened");
+  const listening = () => {
+    if (listener === undefined) {
+      throw Error("nobody listens on the transport");
     }
 
-    return openedWith;
+    return listener;
   };
 
   return {
-    transportFactory,
+    transport,
 
-    opened,
     sentDatagrams: () => {
       return sent;
     },
-    closeCount: () => {
-      return closeCount;
+    stopCount: () => {
+      return stopCount;
     },
     failSend: ({ error }: { error: Error | undefined }) => {
       sendError = error;
     },
     deliver: ({ data }: { data: Uint8Array }) => {
-      opened().onData({ data });
+      listening().onData({ data });
     },
     raise: ({ error }: { error: Error }) => {
-      opened().onError({ error });
+      listening().onError({ error });
     },
   };
 };

@@ -1,10 +1,9 @@
 import assert from "node:assert";
 import { describe, it } from "mocha";
-import { AF_NETLINK, NETLINK_ROUTE } from "./constants.ts";
-import { createPo6TransportFactory } from "./po6-transport.ts";
-import { hostStructures } from "./structures.ts";
+import { AF_NETLINK } from "./constants.ts";
+import { createPo6NetlinkTransport } from "./po6-transport.ts";
+import { formatNetlinkAddress, hostStructures } from "./structures.ts";
 import { createFakePo6, createFakePoller } from "./test-support/fakes.ts";
-import type { TNetlinkAddress } from "./netlink-socket.ts";
 
 const structures = hostStructures;
 
@@ -15,20 +14,19 @@ const createTestSetup = () => {
   let received: Uint8Array[] = [];
   let errors: Error[] = [];
 
-  const transportFactory = createPo6TransportFactory({
-    po6: fakePo6.po6,
-    kernelAbi: fakePo6.kernelAbi,
-    createPoller: fakePoller.createPoller,
-    structures,
-  });
+  const createTransport = () => {
+    return createPo6NetlinkTransport({
+      fd: fakePo6.fd,
+      po6: fakePo6.po6,
+      kernelAbi: fakePo6.kernelAbi,
+      createPoller: fakePoller.createPoller,
+    });
+  };
 
-  const open = ({ address = { nl_pid: 0n, nl_groups: 0n }, onData }: {
-    address?: TNetlinkAddress,
-    onData?: (args: { data: Uint8Array }) => void,
-  } = {}) => {
-    return transportFactory({
-      family: NETLINK_ROUTE,
-      address,
+  const listen = ({ onData }: { onData?: (args: { data: Uint8Array }) => void } = {}) => {
+    const transport = createTransport();
+
+    const listener = transport.listen({
       onData: onData ?? (({ data }) => {
         received = [...received, data];
       }),
@@ -36,12 +34,15 @@ const createTestSetup = () => {
         errors = [...errors, error];
       },
     });
+
+    return { transport, listener };
   };
 
   return {
     fakePo6,
     fakePoller,
-    open,
+    createTransport,
+    listen,
     received: () => {
       return received;
     },
@@ -52,86 +53,51 @@ const createTestSetup = () => {
 };
 
 describe("po6 transport", () => {
-  describe("opening", () => {
-    it("should create a non-blocking netlink socket for the family", () => {
-      const { fakePo6, open } = createTestSetup();
-      open();
+  describe("creation", () => {
+    it("should report the address the socket is bound to", () => {
+      const { fakePo6, createTransport } = createTestSetup();
+      fakePo6.setSockname({ sockaddr: formatNetlinkAddress({ address: { nl_pid: 1234n, nl_groups: 5n } }) });
 
-      assert.deepStrictEqual(fakePo6.callsOf({ name: "socket" }), [{
-        domain: AF_NETLINK,
-        type: 2n | 0o4000n | 0o2000000n,
-        protocol: NETLINK_ROUTE,
-      }]);
+      const transport = createTransport();
+
+      assert.deepStrictEqual(transport.address, { nl_pid: 1234n, nl_groups: 5n });
+      assert.deepStrictEqual(fakePo6.callsOf({ name: "getsockname" }), [{ fd: fakePo6.fd }]);
     });
 
-    it("should bind to the requested address", () => {
-      const { fakePo6, open } = createTestSetup();
-      open({ address: { nl_pid: 5n, nl_groups: 3n } });
+    it("should not wait for data before listen() is called", () => {
+      const { fakePoller, createTransport } = createTestSetup();
+      createTransport();
 
-      const [{ fd, sockaddr }] = fakePo6.callsOf({ name: "bind" });
-      assert.strictEqual(fd, fakePo6.fd);
-      assert.deepStrictEqual(structures.sockaddrNl.parse({ data: sockaddr as Uint8Array }), {
-        nl_family: AF_NETLINK,
-        nl_pad: 0n,
-        nl_pid: 5n,
-        nl_groups: 3n,
-      });
+      assert.strictEqual(fakePoller.fdOfPoller(), undefined);
     });
 
-    it("should report the address assigned by the kernel", () => {
-      const { fakePo6, open } = createTestSetup();
-      fakePo6.assignPid({ pid: 1234 });
-
-      const transport = open({ address: { nl_pid: 0n, nl_groups: 1n } });
-
-      assert.deepStrictEqual(transport.address, { nl_pid: 1234n, nl_groups: 1n });
-    });
-
-    it("should wait for the socket to become readable", () => {
-      const { fakePo6, fakePoller, open } = createTestSetup();
-      open();
-
-      assert.strictEqual(fakePoller.fdOfPoller(), fakePo6.fd);
-      assert.strictEqual(fakePoller.isArmed(), true);
-    });
-
-    it("should throw if socket() fails", () => {
-      const { fakePo6, open } = createTestSetup();
-      fakePo6.failNext({ name: "socket", errno: fakePo6.kernelAbi.errnoCodes.EPROTONOSUPPORT });
+    it("should throw if getsockname() fails", () => {
+      const { fakePo6, createTransport } = createTestSetup();
+      fakePo6.failNext({ name: "getsockname", errno: fakePo6.kernelAbi.errnoCodes.EBADF });
 
       assert.throws(() => {
-        open();
-      }, /socket\(\) failed with EPROTONOSUPPORT/);
-      assert.deepStrictEqual(fakePo6.callsOf({ name: "close" }), []);
+        createTransport();
+      }, /getsockname\(\) failed with EBADF/);
     });
 
-    (["bind", "getsockname"] as const).forEach((name) => {
-      it(`should close the socket and throw if ${name}() fails`, () => {
-        const { fakePo6, open } = createTestSetup();
-        fakePo6.failNext({ name, errno: fakePo6.kernelAbi.errnoCodes.EADDRINUSE });
+    it("should throw if the file descriptor is not a netlink socket", () => {
+      const { fakePo6, createTransport } = createTestSetup();
 
-        assert.throws(() => {
-          open();
-        }, new RegExp(`${name}\\(\\) failed with EADDRINUSE`));
-        assert.deepStrictEqual(fakePo6.callsOf({ name: "close" }), [{ fd: fakePo6.fd }]);
-      });
-    });
-
-    it("should close the socket and throw if the poller cannot be created", () => {
-      const { fakePo6, fakePoller, open } = createTestSetup();
-      fakePoller.failCreation({ error: Error("no poller") });
+      // struct sockaddr_in of AF_INET
+      const sockaddr = new Uint8Array(16);
+      sockaddr.set([2, 0], 0);
+      fakePo6.setSockname({ sockaddr });
 
       assert.throws(() => {
-        open();
-      }, /no poller/);
-      assert.deepStrictEqual(fakePo6.callsOf({ name: "close" }), [{ fd: fakePo6.fd }]);
+        createTransport();
+      }, /file descriptor 42 is not a netlink socket, its address family is 2/);
     });
   });
 
   describe("sending", () => {
     it("should send the datagram to the kernel", () => {
-      const { fakePo6, open } = createTestSetup();
-      const transport = open();
+      const { fakePo6, createTransport } = createTestSetup();
+      const transport = createTransport();
 
       const data = Uint8Array.from([1, 2, 3]);
       transport.send({ data });
@@ -150,8 +116,8 @@ describe("po6 transport", () => {
     });
 
     it("should throw if sendmsg() fails", () => {
-      const { fakePo6, open } = createTestSetup();
-      const transport = open();
+      const { fakePo6, createTransport } = createTestSetup();
+      const transport = createTransport();
       fakePo6.failNext({ name: "sendmsg", errno: fakePo6.kernelAbi.errnoCodes.ENOBUFS });
 
       assert.throws(() => {
@@ -160,10 +126,18 @@ describe("po6 transport", () => {
     });
   });
 
-  describe("receiving", () => {
+  describe("listening", () => {
+    it("should wait for the socket to become readable", () => {
+      const { fakePo6, fakePoller, listen } = createTestSetup();
+      listen();
+
+      assert.strictEqual(fakePoller.fdOfPoller(), fakePo6.fd);
+      assert.strictEqual(fakePoller.isArmed(), true);
+    });
+
     it("should deliver all queued datagrams and wait for more", () => {
-      const { fakePo6, fakePoller, open, received } = createTestSetup();
-      open();
+      const { fakePo6, fakePoller, listen, received } = createTestSetup();
+      listen();
 
       fakePo6.queueIncoming({ datagram: Uint8Array.from([1, 2, 3]) });
       fakePo6.queueIncoming({ datagram: Uint8Array.from([4, 5]) });
@@ -176,8 +150,8 @@ describe("po6 transport", () => {
     });
 
     it("should peek the length of the datagram before receiving it", () => {
-      const { fakePo6, fakePoller, open } = createTestSetup();
-      open();
+      const { fakePo6, fakePoller, listen } = createTestSetup();
+      listen();
 
       fakePo6.queueIncoming({ datagram: new Uint8Array(70_000) });
       fakePoller.triggerReadable();
@@ -191,8 +165,8 @@ describe("po6 transport", () => {
     });
 
     it("should deliver empty datagrams", () => {
-      const { fakePo6, fakePoller, open, received } = createTestSetup();
-      open();
+      const { fakePo6, fakePoller, listen, received } = createTestSetup();
+      listen();
 
       fakePo6.queueIncoming({ datagram: new Uint8Array(0) });
       fakePoller.triggerReadable();
@@ -203,8 +177,8 @@ describe("po6 transport", () => {
     });
 
     it("should report lost messages and keep receiving", () => {
-      const { fakePo6, fakePoller, open, received, errors } = createTestSetup();
-      open();
+      const { fakePo6, fakePoller, listen, received, errors } = createTestSetup();
+      listen();
 
       fakePo6.queueIncoming({ datagram: { errno: fakePo6.kernelAbi.errnoCodes.ENOBUFS } });
       fakePo6.queueIncoming({ datagram: Uint8Array.from([1]) });
@@ -218,8 +192,8 @@ describe("po6 transport", () => {
     });
 
     it("should report other receive errors and stop receiving", () => {
-      const { fakePo6, fakePoller, open, errors } = createTestSetup();
-      open();
+      const { fakePo6, fakePoller, listen, errors } = createTestSetup();
+      listen();
 
       fakePo6.queueIncoming({ datagram: { errno: fakePo6.kernelAbi.errnoCodes.EBADF } });
       fakePoller.triggerReadable();
@@ -229,8 +203,8 @@ describe("po6 transport", () => {
     });
 
     it("should report errors of the second recvmsg()", () => {
-      const { fakePo6, fakePoller, open, received, errors } = createTestSetup();
-      open();
+      const { fakePo6, fakePoller, listen, received, errors } = createTestSetup();
+      listen();
 
       fakePo6.queueIncoming({ datagram: Uint8Array.from([1]) });
       fakePo6.failNext({ name: "recvmsg", errno: undefined });
@@ -238,31 +212,12 @@ describe("po6 transport", () => {
       fakePoller.triggerReadable();
 
       assert.deepStrictEqual(received(), []);
-      assert.match(errors()[0].message, /recvmsg\(\) failed/);
-    });
-
-    it("should stop receiving if the socket is closed while delivering", () => {
-      const { fakePo6, fakePoller, open } = createTestSetup();
-
-      let deliveries = 0;
-      const transport = open({
-        onData: () => {
-          deliveries += 1;
-          transport.close();
-        },
-      });
-
-      fakePo6.queueIncoming({ datagram: Uint8Array.from([1]) });
-      fakePo6.queueIncoming({ datagram: Uint8Array.from([2]) });
-      fakePoller.triggerReadable();
-
-      assert.strictEqual(deliveries, 1);
-      assert.strictEqual(fakePoller.isArmed(), false);
+      assert.match(errors()[0].message, /recvmsg\(\) failed with EFAULT/);
     });
 
     it("should report poll errors", () => {
-      const { fakePoller, open, errors } = createTestSetup();
-      open();
+      const { fakePoller, listen, errors } = createTestSetup();
+      listen();
 
       fakePoller.triggerError({ errorCode: -9 });
 
@@ -272,25 +227,37 @@ describe("po6 transport", () => {
     });
   });
 
-  describe("closing", () => {
-    it("should close the poller and the socket", () => {
-      const { fakePo6, fakePoller, open } = createTestSetup();
-      const transport = open();
+  describe("stopping", () => {
+    it("should close the poller but leave the socket open", () => {
+      const { fakePoller, listen } = createTestSetup();
+      const { listener } = listen();
 
-      transport.close();
+      listener.stop();
+      listener.stop();
 
       assert.strictEqual(fakePoller.isClosed(), true);
-      assert.deepStrictEqual(fakePo6.callsOf({ name: "close" }), [{ fd: fakePo6.fd }]);
     });
 
-    it("should throw if close() fails", () => {
-      const { fakePo6, open } = createTestSetup();
-      const transport = open();
-      fakePo6.failNext({ name: "close", errno: fakePo6.kernelAbi.errnoCodes.EBADF });
+    it("should stop receiving if stopped while delivering", () => {
+      const { fakePo6, fakePoller, createTransport } = createTestSetup();
 
-      assert.throws(() => {
-        transport.close();
-      }, /close\(\) failed with EBADF/);
+      let deliveries = 0;
+      const listener = createTransport().listen({
+        onData: () => {
+          deliveries += 1;
+          listener.stop();
+        },
+        onError: () => {
+          throw Error("unexpected error");
+        },
+      });
+
+      fakePo6.queueIncoming({ datagram: Uint8Array.from([1]) });
+      fakePo6.queueIncoming({ datagram: Uint8Array.from([2]) });
+      fakePoller.triggerReadable();
+
+      assert.strictEqual(deliveries, 1);
+      assert.strictEqual(fakePoller.isArmed(), false);
     });
   });
 });

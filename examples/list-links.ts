@@ -2,7 +2,8 @@
 //
 //   node examples/list-links.ts
 
-import { NETLINK_ROUTE, NLM_F_DUMP, openNetlinkSocket } from "../lib/index.ts";
+import { NETLINK_ROUTE, NLM_F_DUMP } from "../lib/index.ts";
+import { openNetlinkSocket } from "./open-netlink-socket.ts";
 
 // <linux/rtnetlink.h> and <linux/if_link.h>
 const RTM_GETLINK = 18n;
@@ -40,7 +41,7 @@ const interfaceNameOf = ({ payload }: { payload: Uint8Array }) => {
   return undefined;
 };
 
-const socket = openNetlinkSocket({ family: NETLINK_ROUTE });
+const { socket, close } = openNetlinkSocket({ family: NETLINK_ROUTE });
 
 try {
   const links = await socket.talk({
@@ -53,5 +54,5 @@ try {
     console.log(`${index}: ${interfaceNameOf({ payload })}`);
   });
 } finally {
-  socket.close();
+  close();
 }

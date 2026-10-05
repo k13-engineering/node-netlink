@@ -6,7 +6,8 @@ import {
   parseMessages,
   type TNetlinkMessage
 } from "./message.ts";
-import type { TNetlinkStructures } from "./structures.ts";
+import { createErrorFromErrno } from "./errno.ts";
+import { hostStructures, type TNetlinkStructures } from "./structures.ts";
 
 type TNetlinkAddress = {
   nl_pid: bigint;
@@ -14,28 +15,22 @@ type TNetlinkAddress = {
 };
 
 /**
- * A bound netlink socket that sends and receives raw datagrams.
+ * A netlink socket owned by the caller, opened and bound outside of this library.
  *
  * This is the seam between the netlink protocol handling and the operating system.
- * `createPo6TransportFactory()` provides the implementation on top of real sockets,
- * tests can inject fakes instead.
+ * `createPo6NetlinkTransport()` adapts a file descriptor, tests inject fakes.
  */
 type TNetlinkTransport = {
-  // the address the socket is bound to, as reported by getsockname()
+  // the address the socket is bound to
   address: TNetlinkAddress;
   // sends a datagram to the kernel, throws on failure
   send: (args: { data: Uint8Array }) => void;
-  // closes the socket, no callbacks are called afterwards
-  close: () => void;
+  // starts passing received datagrams to onData until stop() is called
+  listen: (args: {
+    onData: (args: { data: Uint8Array }) => void;
+    onError: (args: { error: Error }) => void;
+  }) => { stop: () => void };
 };
-
-type TNetlinkTransportFactory = (args: {
-  family: bigint;
-  // requested address, nl_pid 0 lets the kernel assign a port id
-  address: TNetlinkAddress;
-  onData: (args: { data: Uint8Array }) => void;
-  onError: (args: { error: Error }) => void;
-}) => TNetlinkTransport;
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_SEQ = 0xFFFF_FFFFn;
@@ -75,25 +70,18 @@ type TNetlinkSocket = {
   tryTalk: (args: TTalkArgs) => Promise<TTryTalkResult>;
   // like tryTalk, but rejects if the kernel reported an error
   talk: (args: TTalkArgs) => Promise<TNetlinkMessage[]>;
-  // closes the socket, pending requests are rejected
-  close: () => void;
+  // stops listening on the transport and rejects pending requests, the transport itself is left open
+  detach: () => void;
 };
 
-type TOpenArgs = {
-  family: bigint;
-  nl_pid?: bigint;
-  nl_groups?: bigint;
+type TCreateNetlinkSocketArgs = {
+  transport: TNetlinkTransport;
   // called for every received message that is not a response to a pending request
   onMessage?: (args: { message: TNetlinkMessage }) => void;
   // called for errors while receiving, if omitted such errors are thrown asynchronously
   onError?: (args: { error: Error }) => void;
-};
-
-type TNetlinkDependencies = {
-  transportFactory: TNetlinkTransportFactory;
-  structures: TNetlinkStructures;
-  createErrorFromErrno: (args: { operation: string, errno: number }) => Error;
-  reportUnhandledError: (args: { error: Error }) => void;
+  // layouts of the kernel structures, the ones of the host by default
+  structures?: TNetlinkStructures;
 };
 
 type TPendingRequest = {
@@ -113,222 +101,214 @@ const isRequest = ({ message }: { message: TNetlinkMessage }) => {
   return (message.header.nlmsg_flags & NLM_F_REQUEST) !== 0n;
 };
 
-const createNetlink = ({ transportFactory, structures, createErrorFromErrno, reportUnhandledError }: TNetlinkDependencies) => {
+// errors without an onError handler must not go unnoticed, so they surface as uncaught exceptions
+const throwAsynchronously = ({ error }: { error: Error }) => {
+  queueMicrotask(() => {
+    throw error;
+  });
+};
 
-  // eslint-disable-next-line max-statements
-  const open = ({ family, nl_pid = 0n, nl_groups = 0n, onMessage, onError }: TOpenArgs): TNetlinkSocket => {
+const createSeqAllocator = () => {
+  let nextSeq = 1n;
 
-    let closed = false;
-    let nextSeq = 1n;
-    let pendingRequests: Record<string, TPendingRequest> = {};
+  return () => {
+    const seq = nextSeq;
+    nextSeq = seqAfter({ seq });
+    return seq;
+  };
+};
 
-    const handleError = ({ error }: { error: Error }) => {
-      if (onError === undefined) {
-        reportUnhandledError({ error });
-        return;
+const createNetlinkSocket = ({
+  transport,
+  onMessage,
+  onError = throwAsynchronously,
+  structures = hostStructures,
+}: TCreateNetlinkSocketArgs): TNetlinkSocket => {
+
+  let detached = false;
+  let pendingRequests: Record<string, TPendingRequest> = {};
+
+  const removePendingRequest = ({ seq }: { seq: bigint }) => {
+    const { [seq.toString()]: request, ...otherRequests } = pendingRequests;
+    pendingRequests = otherRequests;
+
+    clearTimeout(request.timeout);
+    return request;
+  };
+
+  const finishRequest = ({ request, message }: { request: TPendingRequest, message: TNetlinkMessage }) => {
+    let errno: number | undefined;
+
+    try {
+      errno = errnoOfMessage({ message, structures });
+    } catch (ex) {
+      request.reject(ex as Error);
+      return;
+    }
+
+    request.resolve({ errno, messages: request.messages });
+  };
+
+  const deliverUnsolicited = ({ message }: { message: TNetlinkMessage }) => {
+    if (onMessage !== undefined) {
+      onMessage({ message });
+    }
+  };
+
+  const dispatchMessage = ({ message }: { message: TNetlinkMessage }) => {
+    const { nlmsg_seq } = message.header;
+    const request = pendingRequests[nlmsg_seq.toString()];
+
+    if (request === undefined || isRequest({ message })) {
+      deliverUnsolicited({ message });
+      return;
+    }
+
+    if (!isTerminatingMessage({ message })) {
+      pendingRequests = {
+        ...pendingRequests,
+        [nlmsg_seq.toString()]: { ...request, messages: [...request.messages, message] },
+      };
+      return;
+    }
+
+    removePendingRequest({ seq: nlmsg_seq });
+    finishRequest({ request, message });
+  };
+
+  const onData = ({ data }: { data: Uint8Array }) => {
+    let messages: TNetlinkMessage[];
+
+    try {
+      messages = parseMessages({ data, structures });
+    } catch (ex) {
+      onError({ error: ex as Error });
+      return;
+    }
+
+    // a handler may detach the socket, the remaining messages are dropped then
+    messages.forEach((message) => {
+      if (!detached) {
+        dispatchMessage({ message });
       }
+    });
+  };
 
-      onError({ error });
-    };
+  const listener = transport.listen({ onData, onError });
 
-    const removePendingRequest = ({ seq }: { seq: bigint }) => {
-      const { [seq.toString()]: request, ...otherRequests } = pendingRequests;
-      pendingRequests = otherRequests;
+  const allocateSeq = createSeqAllocator();
 
-      clearTimeout(request.timeout);
-      return request;
-    };
+  const assertAttached = () => {
+    if (detached) {
+      throw Error("netlink socket is detached");
+    }
+  };
 
-    const finishRequest = ({ request, message }: { request: TPendingRequest, message: TNetlinkMessage }) => {
-      let errno: number | undefined;
+  const send: TNetlinkSocket["send"] = ({ header, payload }) => {
+    assertAttached();
 
-      try {
-        errno = errnoOfMessage({ message, structures });
-      } catch (ex) {
-        request.reject(ex as Error);
-        return;
-      }
+    const {
+      nlmsg_type,
+      nlmsg_flags = NLM_F_REQUEST,
+      nlmsg_seq = allocateSeq(),
+      nlmsg_pid = 0n,
+    } = header;
 
-      request.resolve({ errno, messages: request.messages });
-    };
-
-    const deliverUnsolicited = ({ message }: { message: TNetlinkMessage }) => {
-      if (onMessage !== undefined) {
-        onMessage({ message });
-      }
-    };
-
-    const dispatchMessage = ({ message }: { message: TNetlinkMessage }) => {
-      const { nlmsg_seq } = message.header;
-      const request = pendingRequests[nlmsg_seq.toString()];
-
-      if (request === undefined || isRequest({ message })) {
-        deliverUnsolicited({ message });
-        return;
-      }
-
-      if (!isTerminatingMessage({ message })) {
-        pendingRequests = {
-          ...pendingRequests,
-          [nlmsg_seq.toString()]: { ...request, messages: [...request.messages, message] },
-        };
-        return;
-      }
-
-      removePendingRequest({ seq: nlmsg_seq });
-      finishRequest({ request, message });
-    };
-
-    const onData = ({ data }: { data: Uint8Array }) => {
-      let messages: TNetlinkMessage[];
-
-      try {
-        messages = parseMessages({ data, structures });
-      } catch (ex) {
-        handleError({ error: ex as Error });
-        return;
-      }
-
-      // a handler may close the socket, the remaining messages are dropped then
-      messages.forEach((message) => {
-        if (!closed) {
-          dispatchMessage({ message });
-        }
-      });
-    };
-
-    const transport = transportFactory({
-      family,
-      address: { nl_pid, nl_groups },
-      onData,
-      onError: handleError,
+    const data = formatMessage({
+      message: {
+        header: { nlmsg_type, nlmsg_flags, nlmsg_seq, nlmsg_pid },
+        payload,
+      },
+      structures,
     });
 
-    const allocateSeq = () => {
-      const seq = nextSeq;
-      nextSeq = seqAfter({ seq });
-      return seq;
-    };
+    transport.send({ data });
 
-    const assertOpen = () => {
-      if (closed) {
-        throw Error("netlink socket is closed");
-      }
-    };
+    return { nlmsg_seq };
+  };
 
-    const send: TNetlinkSocket["send"] = ({ header, payload }) => {
-      assertOpen();
+  const tryTalk: TNetlinkSocket["tryTalk"] = ({ header, payload, timeoutMs = DEFAULT_TIMEOUT_MS }) => {
+    return new Promise((resolve, reject) => {
+      assertAttached();
 
-      const {
-        nlmsg_type,
-        nlmsg_flags = NLM_F_REQUEST,
-        nlmsg_seq = allocateSeq(),
-        nlmsg_pid: messagePid = 0n,
-      } = header;
+      const seq = allocateSeq();
 
-      const data = formatMessage({
-        message: {
-          header: { nlmsg_type, nlmsg_flags, nlmsg_seq, nlmsg_pid: messagePid },
+      const timeout = setTimeout(() => {
+        removePendingRequest({ seq });
+        reject(Error(`netlink request timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+
+      pendingRequests = {
+        ...pendingRequests,
+        [seq.toString()]: { messages: [], resolve, reject, timeout },
+      };
+
+      try {
+        send({
+          header: {
+            nlmsg_type: header.nlmsg_type,
+            nlmsg_flags: (header.nlmsg_flags ?? 0n) | NLM_F_REQUEST | NLM_F_ACK,
+            nlmsg_seq: seq,
+          },
           payload,
-        },
-        structures,
-      });
-
-      transport.send({ data });
-
-      return { nlmsg_seq };
-    };
-
-    const tryTalk: TNetlinkSocket["tryTalk"] = ({ header, payload, timeoutMs = DEFAULT_TIMEOUT_MS }) => {
-      return new Promise((resolve, reject) => {
-        assertOpen();
-
-        const seq = allocateSeq();
-
-        const timeout = setTimeout(() => {
-          removePendingRequest({ seq });
-          reject(Error(`netlink request timed out after ${timeoutMs} ms`));
-        }, timeoutMs);
-
-        pendingRequests = {
-          ...pendingRequests,
-          [seq.toString()]: { messages: [], resolve, reject, timeout },
-        };
-
-        try {
-          send({
-            header: {
-              nlmsg_type: header.nlmsg_type,
-              nlmsg_flags: (header.nlmsg_flags ?? 0n) | NLM_F_REQUEST | NLM_F_ACK,
-              nlmsg_seq: seq,
-            },
-            payload,
-          });
-        } catch (ex) {
-          removePendingRequest({ seq });
-          throw ex;
-        }
-      });
-    };
-
-    const talk: TNetlinkSocket["talk"] = async (args) => {
-      const { errno, messages } = await tryTalk(args);
-
-      if (errno !== undefined) {
-        throw createErrorFromErrno({ operation: `netlink request of type ${args.header.nlmsg_type}`, errno });
+        });
+      } catch (ex) {
+        removePendingRequest({ seq });
+        throw ex;
       }
+    });
+  };
 
-      return messages;
-    };
+  const talk: TNetlinkSocket["talk"] = async (args) => {
+    const { errno, messages } = await tryTalk(args);
 
-    const close = () => {
-      if (closed) {
-        return;
-      }
+    if (errno !== undefined) {
+      throw createErrorFromErrno({ operation: `netlink request of type ${args.header.nlmsg_type}`, errno });
+    }
 
-      closed = true;
+    return messages;
+  };
 
-      const requests = Object.values(pendingRequests);
-      pendingRequests = {};
+  const detach = () => {
+    if (detached) {
+      return;
+    }
 
-      requests.forEach((request) => {
-        clearTimeout(request.timeout);
-        request.reject(Error("netlink socket was closed while waiting for a response"));
-      });
+    detached = true;
+    listener.stop();
 
-      transport.close();
-    };
+    const requests = Object.values(pendingRequests);
+    pendingRequests = {};
 
-    return {
-      nl_pid: transport.address.nl_pid,
-      nl_groups: transport.address.nl_groups,
-
-      send,
-      tryTalk,
-      talk,
-      close,
-    };
+    requests.forEach((request) => {
+      clearTimeout(request.timeout);
+      request.reject(Error("netlink socket was detached while waiting for a response"));
+    });
   };
 
   return {
-    open,
+    nl_pid: transport.address.nl_pid,
+    nl_groups: transport.address.nl_groups,
+
+    send,
+    tryTalk,
+    talk,
+    detach,
   };
 };
 
 export {
-  createNetlink,
+  createNetlinkSocket,
   seqAfter,
 };
 
 export type {
   TNetlinkAddress,
   TNetlinkTransport,
-  TNetlinkTransportFactory,
   TNetlinkSocket,
-  TOpenArgs,
+  TCreateNetlinkSocketArgs,
   TTalkArgs,
   TTryTalkResult,
   TRequestHeader,
   TSendHeader,
-  TNetlinkDependencies,
 };

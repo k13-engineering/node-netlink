@@ -1,7 +1,7 @@
 {
   "name": "node-netlink",
   "type": "module",
-  "description": "Typed netlink sockets for Node.js on Linux",
+  "description": "The netlink protocol for Node.js on Linux, on top of sockets you own",
   "publishConfig": {
     "access": "public"
   },

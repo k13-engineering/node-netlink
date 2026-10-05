@@ -3,14 +3,15 @@
 //
 //   node examples/monitor-links.ts
 
-import { NETLINK_ROUTE, openNetlinkSocket } from "../lib/index.ts";
+import { NETLINK_ROUTE } from "../lib/index.ts";
+import { openNetlinkSocket } from "./open-netlink-socket.ts";
 
 // <linux/rtnetlink.h>
 const RTM_NEWLINK = 16n;
 const RTM_DELLINK = 17n;
 const RTMGRP_LINK = 1n;
 
-const socket = openNetlinkSocket({
+const { socket, close } = openNetlinkSocket({
   family: NETLINK_ROUTE,
   nl_groups: RTMGRP_LINK,
   onMessage: ({ message }) => {
@@ -31,5 +32,5 @@ const socket = openNetlinkSocket({
 console.log(`listening for link events on port id ${socket.nl_pid}, press Ctrl+C to stop`);
 
 process.once("SIGINT", () => {
-  socket.close();
+  close();
 });

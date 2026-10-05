@@ -1,5 +1,6 @@
 import { define, type TAbi } from "ya-struct";
 import { hostAbi } from "po6";
+import { AF_NETLINK } from "./constants.ts";
 
 // struct sockaddr_nl from <linux/netlink.h>
 const sockaddrNlDefinition = {
@@ -56,6 +57,22 @@ type TNetlinkStructures = ReturnType<typeof createNetlinkStructuresFor>;
 
 const hostStructures = createNetlinkStructuresFor({ abi: hostAbi });
 
+/**
+ * Formats a struct sockaddr_nl, e.g. to bind() a netlink socket.
+ */
+const formatNetlinkAddress = ({ address, structures = hostStructures }: {
+  address: { nl_pid: bigint, nl_groups: bigint },
+  structures?: TNetlinkStructures,
+}) => {
+  return structures.sockaddrNl.format({
+    value: {
+      nl_family: AF_NETLINK,
+      nl_pad: 0n,
+      ...address,
+    },
+  });
+};
+
 export {
   sockaddrNlDefinition,
   nlmsghdrDefinition,
@@ -63,6 +80,7 @@ export {
 
   createNetlinkStructuresFor,
   hostStructures,
+  formatNetlinkAddress,
 };
 
 export type {
