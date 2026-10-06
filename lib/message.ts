@@ -46,7 +46,7 @@ const parseOneMessage = ({ data, structures }: { data: Uint8Array, structures: T
  * Splits a received datagram into its netlink messages.
  * Throws if the datagram is malformed.
  */
-const parseMessages = ({ data, structures }: { data: Uint8Array, structures: TNetlinkStructures }) => {
+const parseMessages = ({ data, structures }: { data: Uint8Array, structures: TNetlinkStructures }): TNetlinkMessage[] => {
   let messages: TNetlinkMessage[] = [];
   let remaining = data;
 
@@ -62,7 +62,7 @@ const parseMessages = ({ data, structures }: { data: Uint8Array, structures: TNe
 /**
  * Formats a netlink message, nlmsg_len is calculated from the payload.
  */
-const formatMessage = ({ message, structures }: { message: TNetlinkMessage, structures: TNetlinkStructures }) => {
+const formatMessage = ({ message, structures }: { message: TNetlinkMessage, structures: TNetlinkStructures }): Uint8Array => {
   const { header, payload } = message;
 
   const headerAsBuffer = structures.nlmsghdr.format({
@@ -95,7 +95,7 @@ const readInt32 = ({ payload, structures }: { payload: Uint8Array, structures: T
  * Extracts the errno of an NLMSG_ERROR or NLMSG_DONE message.
  * Returns `undefined` for an acknowledgement (error 0) and for other message types.
  */
-const errnoOfMessage = ({ message, structures }: { message: TNetlinkMessage, structures: TNetlinkStructures }) => {
+const errnoOfMessage = ({ message, structures }: { message: TNetlinkMessage, structures: TNetlinkStructures }): number | undefined => {
   if (!isTerminatingMessage({ message })) {
     return undefined;
   }

@@ -40,11 +40,21 @@ const nlmsgerrDefinition = {
   ],
 } as const;
 
-const sockaddrNl = define({ definition: sockaddrNlDefinition });
-const nlmsghdr = define({ definition: nlmsghdrDefinition });
-const nlmsgerr = define({ definition: nlmsgerrDefinition });
+// spelled out, as the declaration files are generated per file and could not infer these types
+const sockaddrNl: ReturnType<typeof define<typeof sockaddrNlDefinition>> = define({ definition: sockaddrNlDefinition });
+const nlmsghdr: ReturnType<typeof define<typeof nlmsghdrDefinition>> = define({ definition: nlmsghdrDefinition });
+const nlmsgerr: ReturnType<typeof define<typeof nlmsgerrDefinition>> = define({ definition: nlmsgerrDefinition });
 
-const createNetlinkStructuresFor = ({ abi }: { abi: TAbi }) => {
+type TParserOf<T extends { parser: (args: { abi: TAbi }) => object }> = ReturnType<T["parser"]>;
+
+type TNetlinkStructures = {
+  abi: TAbi;
+  sockaddrNl: TParserOf<typeof sockaddrNl>;
+  nlmsghdr: TParserOf<typeof nlmsghdr>;
+  nlmsgerr: TParserOf<typeof nlmsgerr>;
+};
+
+const createNetlinkStructuresFor = ({ abi }: { abi: TAbi }): TNetlinkStructures => {
   return {
     abi,
     sockaddrNl: sockaddrNl.parser({ abi }),
@@ -52,8 +62,6 @@ const createNetlinkStructuresFor = ({ abi }: { abi: TAbi }) => {
     nlmsgerr: nlmsgerr.parser({ abi }),
   };
 };
-
-type TNetlinkStructures = ReturnType<typeof createNetlinkStructuresFor>;
 
 const hostStructures = createNetlinkStructuresFor({ abi: hostAbi });
 
@@ -63,7 +71,7 @@ const hostStructures = createNetlinkStructuresFor({ abi: hostAbi });
 const formatNetlinkAddress = ({ address, structures = hostStructures }: {
   address: { nl_pid: bigint, nl_groups: bigint },
   structures?: TNetlinkStructures,
-}) => {
+}): Uint8Array => {
   return structures.sockaddrNl.format({
     value: {
       nl_family: AF_NETLINK,
